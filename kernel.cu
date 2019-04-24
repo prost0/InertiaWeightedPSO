@@ -1,21 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <GL/glew.h>
 #include <GL/freeglut.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
-#include <cuda_profiler_api.h>
-#include <device_functions.h>
-#include <cuda.h>
-#include <cuda_runtime_api.h>
-#include <device_launch_parameters.h>
 #include <curand_kernel.h>
-#pragma comment(lib, "glew32.lib")
-#include <cuda.h>
-#include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
-#include <chrono>
 
 using namespace std;
 
@@ -44,7 +34,7 @@ const int width = 1280;
 const int height = 720;
 
 const int particle_cnt = 4000;
-const double inertia = 0.981;
+const double inertia = 0.96;
 const double coef_local = 0.4;
 const double coef_global = 0.15;
 const double coef_repultion = 0.5;
@@ -58,7 +48,7 @@ const dim3 threads2D(32, 32);
 const int threads_reduce = 1024;
 const int blocks_reduce = width * height / threads_reduce + 1;
 const int threads1D = THREADS;
-const int blocks1D = ceil((double)particle_cnt / THREADS);
+const int blocks1D = (int)ceil((double)particle_cnt / THREADS);
 
 __constant__ double pi = 3.1415;
 __constant__ int seed = 1234;
@@ -233,15 +223,17 @@ __global__ void repulsive_force(particle *swarm, int particle_cnt)
 {
 	int idx = threadIdx.x + blockIdx.x * blockDim.x;
 	int offsetx = blockDim.x * gridDim.x;
+	int idy = threadIdx.y + blockIdx.y * blockDim.y;
+	int offsety = blockDim.y * gridDim.y;
 	double square_dist;
 
 	for (int i = idx; i < particle_cnt; i += offsetx)
 	{
-		for (int i = 0; i < particle_cnt; i++)
+		for (int j = idy; j < particle_cnt; j += offsety)
 		{
-			square_dist = square(swarm[i].coord.x - swarm[idx].coord.x) + square(swarm[i].coord.y - swarm[idx].coord.y);
-			swarm[idx].repultion_force.x -= (swarm[i].coord.x - swarm[idx].coord.x) / (square(square_dist) + 1e-3);
-			swarm[idx].repultion_force.y -= (swarm[i].coord.y - swarm[idx].coord.y) / (square(square_dist) + 1e-3);
+			square_dist = square(swarm[j].coord.x - swarm[i].coord.x) + square(swarm[j].coord.y - swarm[i].coord.y);
+			swarm[i].repultion_force.x -= (swarm[j].coord.x - swarm[i].coord.x) / (square(square_dist) + 1e-3);
+			swarm[i].repultion_force.y -= (swarm[j].coord.y - swarm[i].coord.y) / (square(square_dist) + 1e-3);
 		}
 	}
 }
@@ -251,11 +243,9 @@ __global__ void update_window_center(particle *swarm, int particle_cnt)
 	double2 sum;
 	for (int i = 0; i < particle_cnt; i++)
 	{
-		sum.x += swarm[i].coord.x;
-		sum.y += swarm[i].coord.y;
+		sum.x += swarm[i].coord.x / particle_cnt;
+		sum.y += swarm[i].coord.y / particle_cnt;
 	}
-	sum.x /= particle_cnt;
-	sum.y /= particle_cnt;
 	dev_center_x = sum.x;
 	dev_center_y = sum.y;
 }
@@ -277,7 +267,6 @@ __global__ void global_best_reduce(particle *swarm, double2 *global_best_after_r
 				shared_min[threadIdx.x * (step + 1) - 1] : shared_min[threadIdx.x * (step + 1) - step / 2 - 1];
 		}
 		__syncthreads();
-		step *= 2;
 	}
 	if (threadIdx.x == 0)
 	{
@@ -285,7 +274,21 @@ __global__ void global_best_reduce(particle *swarm, double2 *global_best_after_r
 	}
 }
 
-__global__ void global_best_final(particle *swarm, double2 *global_best_after_reduce, int size)
+//__global__ void global_best_final(particle *swarm, double2 *global_best_after_reduce, int size, int particle_cnt)
+//{
+//		for (int i = 0; i < size; i++)
+//		{
+//			if (rosenbrock(global_best_after_reduce[i]) < rosenbrock(g_best))
+//				g_best = global_best_after_reduce[i];
+//		}
+//		for (int i = size; i < size; i++)
+//		{
+//			if (rosenbrock(swarm[i].coord) < rosenbrock(g_best))
+//				g_best = swarm[i].coord;
+//		}
+//}
+
+__global__ void global_best_final(particle *swarm, double2 *global_best_after_reduce, int size, int particle_cnt)
 {
 	double2 max;
 	if (size > 0)
@@ -310,21 +313,6 @@ __global__ void global_best_final(particle *swarm, double2 *global_best_after_re
 		g_best = max;
 }
 
-
-//__global__ void global_best_final(particle *swarm, double2 *global_best_after_reduce, int size, int particle_cnt)
-//{
-//		for (int i = 0; i < size; i++)
-//		{
-//			if (rosenbrock(global_best_after_reduce[i]) < rosenbrock(g_best))
-//				g_best = global_best_after_reduce[i];
-//		}
-//		for (int i = size; i < size; i++)
-//		{
-//			if (rosenbrock(swarm[i].coord) < rosenbrock(g_best))
-//				g_best = swarm[i].coord;
-//		}
-//}
-
 __global__ void swarm_start(particle *swarm, int particle_cnt, curandState * state)
 {
 	int idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -336,7 +324,6 @@ __global__ void swarm_start(particle *swarm, int particle_cnt, curandState * sta
 
 		swarm[idx].best_coord.x = swarm[idx].coord.x = curand_uniform(&state[idx]) * width * cos((double)idx / THREADS * 2 * pi);
 		swarm[idx].best_coord.y = swarm[idx].coord.y = curand_uniform(&state[idx]) * height * sin((double)idx / THREADS * 2 * pi);
-
 		swarm[idx].velocity = make_double2(0, 0);
 		swarm[idx].repultion_force = make_double2(0, 0);
 
@@ -349,12 +336,6 @@ void update() {
 	size_t size;
 	CSC(cudaGraphicsMapResources(1, &res, 0));
 	CSC(cudaGraphicsResourceGetMappedPointer((void**)&heat_image, &size, res));
-
-	float time;
-	cudaEvent_t start, stop;
-	CSC(cudaEventCreate(&start));
-	CSC(cudaEventCreate(&stop));
-	CSC(cudaEventRecord(start, 0));
 
 	update_window_center << <1, 1 >> > (dev_swarm, particle_cnt);
 	CSC(cudaGetLastError());
@@ -371,27 +352,20 @@ void update() {
 	heatmap << <blocks2D, threads2D >> > (heat_image);
 	CSC(cudaGetLastError());
 
-	repulsive_force << <blocks1D, threads1D >> > (dev_swarm, particle_cnt);
+	repulsive_force << <blocks2D, threads2D >> > (dev_swarm, particle_cnt);
 	CSC(cudaGetLastError());
 
 	update_coords_and_velocities << <blocks1D, threads1D >> > (inertia, coef_local, coef_global, dt, coef_repultion, dev_swarm, particle_cnt, heat_image, scale_x, scale_y, dev_states);
 	CSC(cudaGetLastError());
 
-	global_best_reduce << <blocks_reduce, threads_reduce >> > (dev_swarm, global_best_after_reduce);
+	global_best_reduce << <particle_cnt / threads_reduce, threads_reduce >> > (dev_swarm, global_best_after_reduce);
 	CSC(cudaGetLastError());
 
-	global_best_final << <1, 1 >> > (dev_swarm, global_best_after_reduce, blocks_reduce);
+	global_best_final << <1, 1 >> > (dev_swarm, global_best_after_reduce, blocks_reduce, particle_cnt);
 	CSC(cudaGetLastError());
 
 	CSC(cudaDeviceSynchronize());
 	CSC(cudaGraphicsUnmapResources(1, &res, 0));
-
-	CSC(cudaEventRecord(stop, 0));
-	CSC(cudaEventSynchronize(stop));
-	CSC(cudaEventElapsedTime(&time, start, stop));
-	CSC(cudaEventDestroy(start));
-	CSC(cudaEventDestroy(stop));
-	printf("%.4f\n", time);
 
 	glutPostRedisplay();
 }
@@ -429,8 +403,8 @@ void MyKeyboardFunc(unsigned char Key, int x, int y)
 
 int main(int argc, char** argv)
 {
-	CSC(cudaMalloc(&dev_swarm, sizeof(particle) * (ceil(particle_cnt / (double)THREADS))  * THREADS));
-	CSC(cudaMalloc(&dev_states, sizeof(curandState) * (ceil(particle_cnt / (double)THREADS)) * THREADS));
+	CSC(cudaMalloc(&dev_swarm, sizeof(particle) * (int)(ceil(particle_cnt / (double)THREADS))  * THREADS));
+	CSC(cudaMalloc(&dev_states, sizeof(curandState) * (int)(ceil(particle_cnt / (double)THREADS)) * THREADS));
 	CSC(cudaMalloc(&global_best_after_reduce, sizeof(double2) * ceil(particle_cnt / (double)THREADS)));
 	CSC(cudaMalloc(&arr_max_after_reduce_dev, sizeof(double) * blocks_reduce));
 	CSC(cudaMalloc(&arr_min_after_reduce_dev, sizeof(double) * blocks_reduce));
