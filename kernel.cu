@@ -7,7 +7,6 @@
 #include <curand_kernel.h>
 #include <cuda_gl_interop.h>
 
-using namespace std;
 
 #define CSC(call) {							\
     cudaError err = call;						\
@@ -18,8 +17,10 @@ using namespace std;
     }									\
 } while (0)
 
+
 #define square(x) ((x)*(x))
 #define THREADS 128
+
 
 struct particle
 {
@@ -33,15 +34,15 @@ struct particle
 const int width = 1280;
 const int height = 720;
 
-const int particle_cnt = 4000;
+double scale_x = 500;
+double scale_y = scale_x * height / width;
+
+const int particle_cnt = 7000;
 const double inertia = 0.96;
 const double coef_local = 0.4;
 const double coef_global = 0.15;
 const double coef_repultion = 0.5;
 const double dt = 0.07;
-
-double scale_x = 500;
-double scale_y = scale_x * height / width;
 
 const dim3 blocks2D(128, 128);
 const dim3 threads2D(32, 32);
@@ -61,14 +62,11 @@ __device__ double image[height * width];
 __device__ double2 g_best;
 
 curandState* dev_states;
-
-struct cudaGraphicsResource *res;
 particle *dev_swarm;
-
+struct cudaGraphicsResource *res;
 
 double *arr_max_after_reduce_dev;
 double *arr_min_after_reduce_dev;
-
 double2 *global_best_after_reduce;
 
 GLuint vbo;
@@ -79,24 +77,20 @@ __device__ double rosenbrock(double2 arg) {
 }
 
 
-__device__ double rosenbrock(int i, int j, double scale_x, double scale_y) {
-	double x = 2.0f * i / (double)(width - 1) - 1.0f;
-	double y = 2.0f * j / (double)(height - 1) - 1.0f;
-	return rosenbrock(make_double2(x * scale_x + dev_center_x, -y * scale_y + dev_center_y));
-}
-
-
 __global__ void rosenbrock_image(double scale_x, double scale_y) {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	int idy = blockIdx.y * blockDim.y + threadIdx.y;
 	int offsetx = blockDim.x * gridDim.x;
 	int offsety = blockDim.y * gridDim.y;
 
+	double x, y;
 	for (int j = idy; j < height; j += offsety)
 	{
 		for (int i = idx; i < width; i += offsetx)
 		{
-			image[j * width + i] = rosenbrock(i, j, scale_x, scale_y);
+			x = (2.0f * i / (double)(width - 1) - 1.0f) * scale_x + dev_center_x;
+			y = -(2.0f * j / (double)(height - 1) - 1.0f) * scale_y + dev_center_y;
+			image[j * width + i] = rosenbrock(make_double2(x, y));
 		}
 	}
 }
@@ -135,23 +129,24 @@ __global__ void minmax_reduce(double *arr_min_after_reduce, double *arr_max_afte
 		arr_min_after_reduce[blockIdx.x] = shared_min[threads_reduce - 1];
 		arr_max_after_reduce[blockIdx.x] = shared_max[threads_reduce - 1];
 	}
-
 }
+
 
 __global__ void minmax(double *arr_min_after_reduce, double *arr_max_after_reduce, int size)
 {
-	double min = arr_min_after_reduce[0];
-	double max = arr_max_after_reduce[0];
-	for (int i = 1; i < size; i++)
+	double min = INFINITY;
+	double max = -INFINITY;
+	for (int i = 0; i < size; i++)
 	{
-		if (arr_min_after_reduce[i] < arr_min_after_reduce[i - 1])
+		if (arr_min_after_reduce[i] < min)
 			min = arr_min_after_reduce[i];
-		if (arr_max_after_reduce[i] > arr_max_after_reduce[i - 1])
+		if (arr_max_after_reduce[i] > max)
 			max = arr_max_after_reduce[i];
 	}
 	dev_func_min = min;
 	dev_func_max = max;
 }
+
 
 __device__ uchar4 get_color(double f) {
 	float k = 1.0 / 6.0;
@@ -171,6 +166,7 @@ __device__ uchar4 get_color(double f) {
 		return make_uchar4(0, 0, 255 - (int)((f - 5 * k) * 255 / k), 0);
 	return make_uchar4(0, 0, 0, 0);
 }
+
 
 __global__ void heatmap(uchar4* data)
 {
@@ -219,17 +215,16 @@ __global__ void update_coords_and_velocities(double inertia, double coef_local, 
 	}
 }
 
+
 __global__ void repulsive_force(particle *swarm, int particle_cnt)
 {
 	int idx = threadIdx.x + blockIdx.x * blockDim.x;
 	int offsetx = blockDim.x * gridDim.x;
-	int idy = threadIdx.y + blockIdx.y * blockDim.y;
-	int offsety = blockDim.y * gridDim.y;
 	double square_dist;
 
 	for (int i = idx; i < particle_cnt; i += offsetx)
 	{
-		for (int j = idy; j < particle_cnt; j += offsety)
+		for (int j = 0; j < particle_cnt; j += 1)
 		{
 			square_dist = square(swarm[j].coord.x - swarm[i].coord.x) + square(swarm[j].coord.y - swarm[i].coord.y);
 			swarm[i].repultion_force.x -= (swarm[j].coord.x - swarm[i].coord.x) / (square(square_dist) + 1e-3);
@@ -238,25 +233,34 @@ __global__ void repulsive_force(particle *swarm, int particle_cnt)
 	}
 }
 
+
 __global__ void update_window_center(particle *swarm, int particle_cnt)
 {
-	double2 sum;
+	double2 sum = make_double2(0, 0);
 	for (int i = 0; i < particle_cnt; i++)
 	{
-		sum.x += swarm[i].coord.x / particle_cnt;
-		sum.y += swarm[i].coord.y / particle_cnt;
+		sum.x += swarm[i].coord.x;
+		sum.y += swarm[i].coord.y;
 	}
+	sum.x /= particle_cnt;
+	sum.y /= particle_cnt;
 	dev_center_x = sum.x;
 	dev_center_y = sum.y;
 }
 
 
-__global__ void global_best_reduce(particle *swarm, double2 *global_best_after_reduce)
+__global__ void global_best_reduce(particle *swarm, double2 *global_best_after_reduce, int particle_cnt)
 {
 	__shared__ double2 shared_min[threads_reduce];
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-	shared_min[threadIdx.x] = swarm[idx].coord;
+	if (idx < particle_cnt) {
+		shared_min[threadIdx.x] = swarm[idx].coord;
+	}
+	else {
+		shared_min[threadIdx.x] = make_double2(INFINITY, INFINITY);
+	}
+	
 	__syncthreads();
 
 	for (int step = 2; step <= threads_reduce; step *= 2)
@@ -274,43 +278,14 @@ __global__ void global_best_reduce(particle *swarm, double2 *global_best_after_r
 	}
 }
 
-//__global__ void global_best_final(particle *swarm, double2 *global_best_after_reduce, int size, int particle_cnt)
-//{
-//		for (int i = 0; i < size; i++)
-//		{
-//			if (rosenbrock(global_best_after_reduce[i]) < rosenbrock(g_best))
-//				g_best = global_best_after_reduce[i];
-//		}
-//		for (int i = size; i < size; i++)
-//		{
-//			if (rosenbrock(swarm[i].coord) < rosenbrock(g_best))
-//				g_best = swarm[i].coord;
-//		}
-//}
 
 __global__ void global_best_final(particle *swarm, double2 *global_best_after_reduce, int size, int particle_cnt)
 {
-	double2 max;
-	if (size > 0)
+	for (int i = 0; i < size; i++)
 	{
-		max = global_best_after_reduce[0];
+		if (rosenbrock(global_best_after_reduce[i]) < rosenbrock(g_best))
+			g_best = global_best_after_reduce[i];
 	}
-	else
-	{
-		max = swarm[0].coord;
-	}
-	for (int i = 1; i < size; i++)
-	{
-		if (rosenbrock(global_best_after_reduce[i]) < rosenbrock(global_best_after_reduce[i - 1]))
-			max = global_best_after_reduce[i];
-	}
-	for (int i = THREADS * size; i < size; i++)
-	{
-		if (rosenbrock(swarm[i].coord) < rosenbrock(max))
-			max = swarm[i].coord;
-	}
-	if (rosenbrock(max) < rosenbrock(g_best))
-		g_best = max;
 }
 
 __global__ void swarm_start(particle *swarm, int particle_cnt, curandState * state)
@@ -332,12 +307,18 @@ __global__ void swarm_start(particle *swarm, int particle_cnt, curandState * sta
 
 
 void update() {
-	uchar4* heat_image;
-	size_t size;
-	CSC(cudaGraphicsMapResources(1, &res, 0));
-	CSC(cudaGraphicsResourceGetMappedPointer((void**)&heat_image, &size, res));
+	float time;
+	cudaEvent_t start, stop;
+	CSC(cudaEventCreate(&start));
+	CSC(cudaEventCreate(&stop));
+	CSC(cudaEventRecord(start, 0));
 
-	update_window_center << <1, 1 >> > (dev_swarm, particle_cnt);
+	size_t size;
+	uchar4* image_heatmap;
+	CSC(cudaGraphicsMapResources(1, &res, 0));
+	CSC(cudaGraphicsResourceGetMappedPointer((void**)&image_heatmap, &size, res));
+
+	update_window_center << <1, 32 >> > (dev_swarm, particle_cnt);
 	CSC(cudaGetLastError());
 
 	rosenbrock_image << <blocks2D, threads2D >> > (scale_x, scale_y);
@@ -349,23 +330,32 @@ void update() {
 	minmax << <1, 1 >> > (arr_min_after_reduce_dev, arr_max_after_reduce_dev, blocks_reduce);
 	CSC(cudaGetLastError());
 
-	heatmap << <blocks2D, threads2D >> > (heat_image);
+	heatmap << <blocks2D, threads2D >> > (image_heatmap);
 	CSC(cudaGetLastError());
 
-	repulsive_force << <blocks2D, threads2D >> > (dev_swarm, particle_cnt);
+	repulsive_force << <blocks1D, threads1D >> > (dev_swarm, particle_cnt);
 	CSC(cudaGetLastError());
 
-	update_coords_and_velocities << <blocks1D, threads1D >> > (inertia, coef_local, coef_global, dt, coef_repultion, dev_swarm, particle_cnt, heat_image, scale_x, scale_y, dev_states);
+	update_coords_and_velocities << <blocks1D, threads1D >> > (inertia, coef_local, coef_global, dt, coef_repultion, dev_swarm, particle_cnt, image_heatmap, scale_x, scale_y, dev_states);
 	CSC(cudaGetLastError());
 
-	global_best_reduce << <particle_cnt / threads_reduce, threads_reduce >> > (dev_swarm, global_best_after_reduce);
+	
+	global_best_reduce << <ceil((double)particle_cnt / threads_reduce), threads_reduce >> > (dev_swarm, global_best_after_reduce, particle_cnt);
 	CSC(cudaGetLastError());
-
-	global_best_final << <1, 1 >> > (dev_swarm, global_best_after_reduce, blocks_reduce, particle_cnt);
+	
+	
+	global_best_final << <1, 32 >> > (dev_swarm, global_best_after_reduce, blocks_reduce, particle_cnt);
 	CSC(cudaGetLastError());
 
 	CSC(cudaDeviceSynchronize());
 	CSC(cudaGraphicsUnmapResources(1, &res, 0));
+
+	CSC(cudaEventRecord(stop, 0));
+	CSC(cudaEventSynchronize(stop));
+	CSC(cudaEventElapsedTime(&time, start, stop));
+	CSC(cudaEventDestroy(start));
+	CSC(cudaEventDestroy(stop));
+	printf("%.4f\n", time);
 
 	glutPostRedisplay();
 }
@@ -377,7 +367,7 @@ void display() {
 	glutSwapBuffers();
 }
 
-void MyKeyboardFunc(unsigned char Key, int x, int y)
+void keys(unsigned char Key, int x, int y)
 {
 	switch (Key)
 	{
@@ -388,13 +378,13 @@ void MyKeyboardFunc(unsigned char Key, int x, int y)
 		exit(0);
 		break;
 	case 'q':
-		scale_x += 20;
+		scale_x *= 1.05;//20;
 		scale_y = scale_x * height / width;
 		break;
 	case 'e':
 		if (scale_x > 30)
 		{
-			scale_x -= 20;
+			scale_x *= 0.95;//20;
 			scale_y = scale_x * height / width;
 		}
 		break;
@@ -419,7 +409,7 @@ int main(int argc, char** argv)
 
 	glutIdleFunc(update);
 	glutDisplayFunc(display);
-	glutKeyboardFunc(MyKeyboardFunc);
+	glutKeyboardFunc(keys);
 
 	glMatrixMode(GL_PROJECTION);
 	glLoadIdentity();
